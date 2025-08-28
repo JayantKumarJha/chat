@@ -6,6 +6,7 @@ from typing import Tuple, List, Dict
 
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+st_autorefresh(interval=300000, key="auto_refresh")  # actually use it
 from PyPDF2 import PdfReader
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
