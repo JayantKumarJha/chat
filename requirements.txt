@@ -4,3 +4,5 @@ huggingface_hub
 torch
 PyPDF2
 reportlab
+streamlit-autorefresh
+
