@@ -1,35 +1,41 @@
-# app_refreshrates.py
-import os
-import time
+# app.py
+"""
+Streamlit FLAN-T5 Q&A app (stable autorefresh, caching, cooldown).
+Requirements: see requirements.txt below.
+
+Put your Hugging Face token into Streamlit secrets as:
+    HUGGINGFACEHUB_API_TOKEN = "hf_xxx..."
+(Use Streamlit Cloud secrets or a local .streamlit/secrets.toml during dev.)
+"""
+
 import io
-from typing import Tuple, List, Dict
+import time
+import textwrap
+from typing import List, Tuple
 
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
-st_autorefresh(interval=300000, key="auto_refresh")  # actually use it
+from transformers import pipeline
+from huggingface_hub import login
+import torch
 from PyPDF2 import PdfReader
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 
-from transformers import pipeline
-from huggingface_hub import login
-import torch
-
 # ---------------------------
-# CONFIG (tweak these values to control refresh behavior)
+# CONFIG
 # ---------------------------
-CALL_COOLDOWN_SECONDS = 30          # min seconds between model calls per session
-PIPELINE_TTL_SECONDS = 300          # pipeline auto-reload TTL (5 minutes)
-ANSWER_CACHE_TTL = 60 * 60          # cache identical Q&A outputs for 1 hour
-PDF_TEXT_CACHE_TTL = 24 * 3600      # cache extracted PDF text for 24 hours
-UI_AUTO_REFRESH_MS = 5 * 60 * 1000  # UI auto-refresh interval: 5 minutes (ms)
+CALL_COOLDOWN_SECONDS = 10        # seconds between allowed model calls per session
+PIPELINE_TTL_SECONDS = 300       # pipeline caching TTL (5 minutes)
+ANSWER_CACHE_TTL = 60 * 60       # cache identical Q&A outputs for 1 hour
+PDF_TEXT_CACHE_TTL = 24 * 3600   # cache extracted PDF text for 24 hours
+UI_AUTO_REFRESH_MS = 5 * 60 * 1000  # 5 minutes (ms)
 
 MODEL_OPTIONS = {
     "small": "google/flan-t5-small",
     "base": "google/flan-t5-base",
     "large": "google/flan-t5-large",
 }
-DEFAULT_MODEL = "base"
+DEFAULT_MODEL_KEY = "base"
 
 CONTEXT_CHAR_LIMIT = {
     "small": 1500,
@@ -38,13 +44,13 @@ CONTEXT_CHAR_LIMIT = {
 }
 
 # ---------------------------
-# STREAMLIT PAGE SETUP
+# PAGE SETUP
 # ---------------------------
-st.set_page_config(page_title="FLAN T5 Q&A (controlled refresh)", layout="wide")
-st.title("📘 FLAN T5 Q&A — controlled refresh & safe reloads")
+st.set_page_config(page_title="FLAN T5 Q&A — stable", layout="wide")
+st.title("📘 FLAN T5 Q&A — stable autorefresh, cached & rate-limited")
 
 # ---------------------------
-# AUTH: login to Hugging Face (from secrets)
+# AUTH: Hugging Face login (from secrets)
 # ---------------------------
 hf_token = None
 if "HUGGINGFACEHUB_API_TOKEN" in st.secrets:
@@ -55,26 +61,30 @@ if "HUGGINGFACEHUB_API_TOKEN" in st.secrets:
     except Exception as e:
         st.sidebar.error(f"Hugging Face login failed: {e}")
 else:
-    st.sidebar.warning("No HUGGINGFACEHUB_API_TOKEN in st.secrets. Public model downloads still work but may be rate-limited.")
+    st.sidebar.warning(
+        "No HUGGINGFACEHUB_API_TOKEN found in st.secrets. Public downloads still work but may be slower/rate-limited."
+    )
 
 # ---------------------------
-# Session state initialization
+# SESSION STATE INIT
 # ---------------------------
 if "last_call_time" not in st.session_state:
     st.session_state["last_call_time"] = 0.0
 if "call_counter" not in st.session_state:
     st.session_state["call_counter"] = 0
 if "active_model_key" not in st.session_state:
-    st.session_state["active_model_key"] = DEFAULT_MODEL
-if "last_pipeline_loaded_at" not in st.session_state:
-    st.session_state["last_pipeline_loaded_at"] = {}  # model_key -> timestamp
-if "pipeline_loading" not in st.session_state:
-    st.session_state["pipeline_loading"] = {}  # model_key -> bool
+    st.session_state["active_model_key"] = DEFAULT_MODEL_KEY
+if "uploaded_files" not in st.session_state:
+    # store filename -> bytes so uploads survive reruns
+    st.session_state["uploaded_files"] = {}
+if "autorefresh_installed" not in st.session_state:
+    st.session_state["autorefresh_installed"] = False
 
 # ---------------------------
-# Helper: can_invoke (rate limiting)
+# HELPERS
 # ---------------------------
 def can_invoke() -> Tuple[bool, float]:
+    """Return (allowed_bool, seconds_until_allowed)."""
     now = time.time()
     elapsed = now - st.session_state["last_call_time"]
     if elapsed >= CALL_COOLDOWN_SECONDS:
@@ -82,302 +92,285 @@ def can_invoke() -> Tuple[bool, float]:
     else:
         return False, CALL_COOLDOWN_SECONDS - elapsed
 
-# ---------------------------
-# Pipeline loader (cached resource with TTL)
-# ---------------------------
-# We use @st.cache_resource so pipelines are cached and auto-expire after PIPELINE_TTL_SECONDS.
-@st.cache_resource(ttl=PIPELINE_TTL_SECONDS)
-def _create_pipeline_resource(model_id: str, device: int):
-    # This is the actual heavy loader used by the cached wrapper
-    return pipeline("text2text-generation", model=model_id, device=device)
-
-def get_device_for_pipeline() -> int:
+def get_device():
+    """Return device index for pipeline: 0 for CUDA, -1 for CPU."""
     return 0 if torch.cuda.is_available() else -1
 
-def load_pipeline(model_key: str):
-    """
-    Public loader that uses the cached resource. This function introduces:
-      - explicit 'apply' flow (only loads when user confirms model change)
-      - a lightweight loading flag to avoid double-loading in the same session.
-    """
+# cached pipeline loader
+@st.cache_resource(ttl=PIPELINE_TTL_SECONDS)
+def load_pipeline_cached(model_id: str, device: int):
+    """Heavy pipeline loader (cached by Streamlit)."""
+    return pipeline("text2text-generation", model=model_id, device=device)
+
+def load_pipeline_by_key(model_key: str):
+    """Convenience wrapper to get pipeline for selected model key."""
     model_id = MODEL_OPTIONS[model_key]
-    # Prevent concurrent loads for same model in this session
-    if st.session_state["pipeline_loading"].get(model_key, False):
-        st.warning("Model is currently loading. Please wait a few seconds and retry.")
-        # try to return cached resource if available
-        try:
-            device = get_device_for_pipeline()
-            return _create_pipeline_resource(model_id, device)
-        except Exception:
-            return None
+    return load_pipeline_cached(model_id, get_device())
 
-    # If the pipeline was loaded recently (within TTL), rely on cached resource instead of forcing reload
-    last_loaded = st.session_state["last_pipeline_loaded_at"].get(model_key, 0)
-    if time.time() - last_loaded < PIPELINE_TTL_SECONDS:
-        # return the cached resource (will be pulled from st.cache_resource)
-        try:
-            device = get_device_for_pipeline()
-            return _create_pipeline_resource(model_id, device)
-        except Exception:
-            # fallthrough to attempt reload
-            pass
-
-    # Otherwise, load pipeline (set loading flag for this session)
-    st.session_state["pipeline_loading"][model_key] = True
-    try:
-        device = get_device_for_pipeline()
-        pipe = _create_pipeline_resource(model_id, device)
-        st.session_state["last_pipeline_loaded_at"][model_key] = time.time()
-    finally:
-        st.session_state["pipeline_loading"][model_key] = False
-
-    return pipe
-
-# ---------------------------
-# Cached answer generator
-# ---------------------------
 @st.cache_data(ttl=ANSWER_CACHE_TTL)
 def answer_cached(model_key: str, prompt: str, max_length: int, do_sample: bool) -> str:
-    pipe = load_pipeline(model_key)
+    """Call pipeline and cache the result (keyed by args)."""
+    pipe = load_pipeline_by_key(model_key)
     res = pipe(prompt, max_length=max_length, do_sample=do_sample)
     text = res[0].get("generated_text") if isinstance(res, list) else str(res)
     return text
 
-# ---------------------------
-# Cached PDF text extraction (prevents re-extraction on refresh)
-# ---------------------------
 @st.cache_data(ttl=PDF_TEXT_CACHE_TTL)
-def extract_pdf_text(file_bytes: bytes) -> str:
+def extract_pdf_text_from_bytes(file_bytes: bytes) -> str:
+    """Extract text from PDF bytes and cache extraction result."""
     reader = PdfReader(io.BytesIO(file_bytes))
     txt = ""
     for p in reader.pages:
         txt += p.extract_text() or ""
     return txt
 
-# ---------------------------
-# SIDEBAR: model selector (use Apply to avoid immediate reload)
-# ---------------------------
-st.sidebar.markdown("### Model & refresh settings")
+def wrap_text_for_pdf(text: str, width: int = 90) -> List[str]:
+    return textwrap.wrap(text, width=width)
 
-# temporary selection (does not auto-apply)
-temp_model_choice = st.sidebar.radio(
+def create_answers_pdf_bytes(qa_pairs: List[tuple]) -> bytes:
+    """Return bytes of a simple PDF containing Q&A pairs."""
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=letter)
+    width, height = letter
+    y = height - 50
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(50, y, "Generated Answers")
+    y -= 30
+    c.setFont("Helvetica", 10)
+    for q, a in qa_pairs:
+        for line in wrap_text_for_pdf(f"Q: {q}", 90):
+            c.drawString(50, y, line)
+            y -= 14
+            if y < 60:
+                c.showPage()
+                y = height - 50
+        y -= 4
+        for line in wrap_text_for_pdf(a, 90):
+            c.drawString(60, y, line)
+            y -= 12
+            if y < 60:
+                c.showPage()
+                y = height - 50
+        y -= 18
+    c.save()
+    buf.seek(0)
+    return buf.getvalue()
+
+def install_autorefresh_html(interval_ms: int):
+    """
+    Inject a small JS snippet that reloads the page after interval_ms.
+    This function ensures injection happens only once per session (avoids duplicate keys).
+    """
+    if st.session_state.get("autorefresh_installed", False):
+        return
+    # small script that sets a timed reload; it guards against multiple installs in the same page via window flag
+    js = f"""
+    <script>
+    (function() {{
+        if (window.__streamlit_autorefresh_installed) {{
+            return;
+        }}
+        window.__streamlit_autorefresh_installed = true;
+        // schedule a reload after interval_ms; this runs once per page load
+        setTimeout(function() {{
+            // preserve scroll and attempt a clean reload
+            window.location.reload();
+        }}, {interval_ms});
+    }})();
+    </script>
+    """
+    # Use a unique single key so Streamlit doesn't complain; we guard with session_state above
+    st.components.v1.html(js, height=0, key="autorefresh_html")
+    st.session_state["autorefresh_installed"] = True
+
+# ---------------------------
+# SIDEBAR: Model & settings
+# ---------------------------
+st.sidebar.markdown("### Model & App Settings")
+
+temp_model_selection = st.sidebar.radio(
     "Select model (click Apply to load)",
     options=list(MODEL_OPTIONS.keys()),
     index=list(MODEL_OPTIONS.keys()).index(st.session_state["active_model_key"])
 )
 
-apply_btn = st.sidebar.button("Apply model selection")
-
-if apply_btn:
-    # change the active model only when user hits Apply (prevents accidental reloads)
-    st.session_state["active_model_key"] = temp_model_choice
-    # optional: clear pipeline cache for that model so loader will fetch fresh resource
+if st.sidebar.button("Apply model selection"):
+    st.session_state["active_model_key"] = temp_model_selection
+    # clear pipeline cache for fresh reload on next call
     try:
-        _create_pipeline_resource.clear()
+        load_pipeline_cached.clear()
     except Exception:
         pass
-    st.sidebar.success(f"Applied model: {temp_model_choice}")
+    st.sidebar.success(f"Model applied: {temp_model_selection}")
 
-st.sidebar.checkbox("Use answer cache", value=True, key="use_cache")
-st.sidebar.checkbox("Deterministic responses (do_sample=False)", value=True, key="deterministic")
-st.sidebar.slider("Max generated tokens (max_length)", min_value=64, max_value=1024, value=256, step=64, key="max_length")
+use_cache = st.sidebar.checkbox("Use answer cache", value=True, key="use_cache")
+deterministic = st.sidebar.checkbox("Deterministic responses (do_sample=False)", value=True, key="deterministic")
+max_length = st.sidebar.slider("Max generated tokens", 64, 1024, 256, 64, key="max_length")
 
-# Autorefresh control (explicit)
-enable_autorefresh = st.sidebar.checkbox("Enable UI auto-refresh every 5 minutes", value=True)
-st.sidebar.caption("Auto-refresh will rerun the script every 5 minutes but heavy resources are cached (pipeline TTL=5m).")
+enable_autorefresh = st.sidebar.checkbox("Enable UI auto-refresh every 5 minutes", value=False, key="enable_autorefresh")
+st.sidebar.caption("When enabled, the page will reload once every 5 minutes (single-shot per page load).")
 
 if enable_autorefresh:
-    # this will cause a rerun precisely every UI_AUTO_REFRESH_MS milliseconds
-    st_autorefresh(interval=UI_AUTO_REFRESH_MS, key="auto_refresh")
-
-# advanced controls
-show_advanced = st.sidebar.expander("Advanced / Controls", expanded=False)
-with show_advanced:
-    if st.button("Force clear pipeline cache (all models)"):
-        try:
-            _create_pipeline_resource.clear()
-            st.session_state["last_pipeline_loaded_at"] = {}
-            st.success("Pipeline cache cleared. Models will reload on next use.")
-        except Exception as e:
-            st.error(f"Could not clear cache: {e}")
-
-    if st.button("Clear answer cache"):
-        try:
-            answer_cached.clear()
-            st.success("Answer cache cleared.")
-        except Exception as e:
-            st.error(f"Could not clear answer cache: {e}")
+    # install the autorefresh JS once (guarded)
+    install_autorefresh_html(UI_AUTO_REFRESH_MS)
 
 st.sidebar.markdown("---")
+if st.sidebar.button("Force clear pipeline cache"):
+    try:
+        load_pipeline_cached.clear()
+        st.sidebar.success("Pipeline cache cleared.")
+    except Exception as e:
+        st.sidebar.error(f"Could not clear pipeline cache: {e}")
+
+if st.sidebar.button("Clear answer cache"):
+    try:
+        answer_cached.clear()
+        st.sidebar.success("Answer cache cleared.")
+    except Exception as e:
+        st.sidebar.error(f"Could not clear answer cache: {e}")
+
 st.sidebar.caption(f"Pipeline TTL: {PIPELINE_TTL_SECONDS}s • Call cooldown: {CALL_COOLDOWN_SECONDS}s")
 
-# expose current active model in UI
-model_choice_key = st.session_state["active_model_key"]
-model_name = MODEL_OPTIONS[model_choice_key]
+# ---------------------------
+# Show current model info
+# ---------------------------
+active_model_key = st.session_state["active_model_key"]
+active_model_name = MODEL_OPTIONS[active_model_key]
+st.sidebar.info(f"Active model: {active_model_key} ({active_model_name})")
 
 # ---------------------------
-# UI: Tabs (Normal Q&A, PDF Q&A)
+# MAIN UI: Tabs
 # ---------------------------
 tab1, tab2 = st.tabs(["💬 Normal Q&A", "📄 PDF Q&A"])
 
-# -----------------------
 # Tab 1: Normal Q&A
-# -----------------------
 with tab1:
-    st.header("Ask a direct question")
-    st.markdown("Type a question below and press **Get Answer**. Rate limits & caching applied to avoid repeated hits.")
-    question = st.text_area("Question", height=120, placeholder="e.g. What is the mechanism of action of acetaminophen?")
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        if st.button("Get Answer", key="direct_get"):
-            allowed, wait = can_invoke()
-            if not allowed:
-                st.warning(f"Please wait {int(wait)}s before another request to avoid rate limits.")
-            elif not question.strip():
-                st.warning("Please type a question.")
-            else:
-                prompt = f"Question: {question}\nAnswer:"
-                with st.spinner("Generating answer..."):
-                    do_sample = not st.session_state["deterministic"]
-                    if st.session_state["use_cache"]:
-                        answer = answer_cached(model_choice_key, prompt, st.session_state["max_length"], do_sample)
-                    else:
-                        pipe = load_pipeline(model_choice_key)
-                        res = pipe(prompt, max_length=st.session_state["max_length"], do_sample=do_sample)
-                        answer = res[0].get("generated_text")
-                st.session_state["last_call_time"] = time.time()
-                st.session_state["call_counter"] += 1
-                st.success("Answer:")
-                st.write(answer)
-    with col2:
-        st.markdown("**Session info**")
-        last = st.session_state["last_call_time"]
-        if last:
-            st.caption(f"Last model call: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last))}")
-        else:
-            st.caption("No model calls yet this session.")
-        st.caption(f"Calls this session: {st.session_state['call_counter']}")
-        st.info(f"Model: {model_name}  •  Cooldown: {CALL_COOLDOWN_SECONDS}s  •  Pipeline TTL: {PIPELINE_TTL_SECONDS}s")
-
-# -----------------------
-# Tab 2: PDF Q&A
-# -----------------------
-with tab2:
-    st.header("Upload PDFs, ask questions, and download answers PDF")
-    st.markdown("You can upload multiple source PDFs (corpus) and either upload a PDF with line-separated questions or type questions.")
-    uploaded_pdfs = st.file_uploader("Source PDF(s) (select multiple)", type="pdf", accept_multiple_files=True)
-    questions_pdf = st.file_uploader("Questions PDF (optional) — one question per new line", type="pdf", key="questions_pdf")
-    manual_questions = st.text_area("Or paste/type questions here (one per line)", height=120, placeholder="One question per line. These will be used if provided.")
-    st.caption("Context may be truncated to keep prompts within safe size limits.")
-
-    if st.button("Process and Generate Answers PDF", key="process_pdf_btn"):
+    st.header("Ask a question")
+    question = st.text_area("Type your question here", height=140, placeholder="e.g. What is the mechanism of acetaminophen?")
+    if st.button("Get Answer"):
         allowed, wait = can_invoke()
         if not allowed:
-            st.warning(f"Please wait {int(wait)}s before another request to avoid rate limits.")
-        elif not uploaded_pdfs:
-            st.warning("Please upload at least one source PDF.")
+            st.warning(f"Please wait {int(wait)}s before making another request.")
+        elif not question.strip():
+            st.warning("Please enter a question.")
         else:
-            with st.spinner("Extracting text from PDFs..."):
-                corpus_parts: List[str] = []
-                for up in uploaded_pdfs:
+            prompt = f"Question: {question}\nAnswer:"
+            with st.spinner("Generating answer..."):
+                do_sample = not deterministic
+                if use_cache:
+                    answer = answer_cached(active_model_key, prompt, max_length, do_sample)
+                else:
+                    pipe = load_pipeline_by_key(active_model_key)
+                    res = pipe(prompt, max_length=max_length, do_sample=do_sample)
+                    answer = res[0].get("generated_text")
+            st.session_state["last_call_time"] = time.time()
+            st.session_state["call_counter"] += 1
+            st.success("Answer")
+            st.write(answer)
+    # session info
+    last = st.session_state["last_call_time"]
+    if last:
+        st.caption(f"Last model call: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last))}")
+    st.caption(f"Calls this session: {st.session_state['call_counter']}")
+    st.info(f"Model: {active_model_name}  •  Cooldown: {CALL_COOLDOWN_SECONDS}s  •  Pipeline TTL: {PIPELINE_TTL_SECONDS}s")
+
+# Tab 2: PDF Q&A
+with tab2:
+    st.header("PDF Q&A — upload PDFs and ask questions")
+    st.markdown("Upload source PDF(s). You can also upload a questions PDF (one question per line) or type questions.")
+
+    # Upload / persist multiple PDFs: when user uploads, store bytes in session_state so it survives reruns
+    uploaded = st.file_uploader("Upload Source PDF(s) (multiple allowed)", type="pdf", accept_multiple_files=True, key="source_upload")
+    if uploaded:
+        for f in uploaded:
+            if f.name not in st.session_state["uploaded_files"]:
+                st.session_state["uploaded_files"][f.name] = f.read()
+        st.success(f"Stored {len(st.session_state['uploaded_files'])} uploaded file(s) in session state.")
+
+    if st.session_state["uploaded_files"]:
+        st.markdown("**Files stored this session:**")
+        for name in list(st.session_state["uploaded_files"].keys()):
+            st.write(f"- {name}")
+        if st.button("Clear stored uploads"):
+            st.session_state["uploaded_files"] = {}
+            st.success("Stored uploads cleared.")
+
+    questions_pdf = st.file_uploader("Upload Questions PDF (optional) — one question per line", type="pdf", key="questions_upload")
+    manual_questions = st.text_area("Or type/paste questions (one per line)", height=120)
+
+    if st.button("Process PDFs and Generate Answers PDF"):
+        # validations
+        allowed, wait = can_invoke()
+        if not allowed:
+            st.warning(f"Please wait {int(wait)}s before making another request.")
+        elif not st.session_state["uploaded_files"]:
+            st.warning("Please upload at least one source PDF (use the uploader above).")
+        else:
+            with st.spinner("Extracting text from PDF(s)..."):
+                corpus_parts = []
+                for name, bytes_data in st.session_state["uploaded_files"].items():
                     try:
-                        file_bytes = up.read()
-                        text = extract_pdf_text(file_bytes)
-                        corpus_parts.append(text)
+                        txt = extract_pdf_text_from_bytes(bytes_data)
+                        corpus_parts.append(txt)
                     except Exception as e:
-                        st.error(f"Failed to read {getattr(up, 'name', 'uploaded file')}: {e}")
+                        st.error(f"Failed to extract text from {name}: {e}")
                 corpus = "\n\n".join(corpus_parts)
 
-                # build questions list
-                questions: List[str] = []
+                # gather questions list
+                questions_list: List[str] = []
                 if manual_questions and manual_questions.strip():
-                    questions = [q.strip() for q in manual_questions.splitlines() if q.strip()]
+                    questions_list = [q.strip() for q in manual_questions.splitlines() if q.strip()]
                 elif questions_pdf:
                     try:
-                        file_bytes = questions_pdf.read()
-                        qtext = extract_pdf_text(file_bytes)
-                        questions = [q.strip() for q in qtext.splitlines() if q.strip()]
+                        qbytes = questions_pdf.read()
+                        qtxt = extract_pdf_text_from_bytes(qbytes)
+                        questions_list = [q.strip() for q in qtxt.splitlines() if q.strip()]
                     except Exception as e:
                         st.error(f"Failed to read questions PDF: {e}")
                 else:
-                    st.warning("No questions provided. Enter questions or upload a questions PDF.")
-                    questions = []
+                    st.warning("No questions provided. Type them or upload a questions PDF.")
+                    questions_list = []
 
-            if not questions:
-                st.warning("No valid questions found — nothing to do.")
+            if not questions_list:
+                st.warning("No valid questions found.")
             else:
-                max_ctx = CONTEXT_CHAR_LIMIT.get(model_choice_key, 2000)
+                # truncate context if too big for the selected model
+                max_ctx = CONTEXT_CHAR_LIMIT.get(active_model_key, 2000)
                 context = corpus
                 truncated = False
                 if len(context) > max_ctx:
                     context = context[:max_ctx]
                     truncated = True
-
                 if truncated:
-                    st.warning(f"Source corpus truncated to {max_ctx} characters for prompt safety.")
+                    st.warning(f"Source text truncated to {max_ctx} chars for prompt safety.")
 
-                answers = []
-                do_sample = not st.session_state["deterministic"]
+                # generate answers (cached if enabled)
+                do_sample = not deterministic
+                qa_pairs = []
                 with st.spinner("Generating answers (may take time for large models)..."):
-                    for q in questions:
+                    for q in questions_list:
                         prompt = f"Context:\n{context}\n\nQuestion: {q}\nAnswer:"
-                        if st.session_state["use_cache"]:
-                            ans_text = answer_cached(model_choice_key, prompt, st.session_state["max_length"], do_sample)
+                        if use_cache:
+                            ans = answer_cached(active_model_key, prompt, max_length, do_sample)
                         else:
-                            pipe = load_pipeline(model_choice_key)
-                            res = pipe(prompt, max_length=st.session_state["max_length"], do_sample=do_sample)
-                            ans_text = res[0].get("generated_text")
-                        answers.append((q, ans_text))
+                            pipe = load_pipeline_by_key(active_model_key)
+                            res = pipe(prompt, max_length=max_length, do_sample=do_sample)
+                            ans = res[0].get("generated_text")
+                        qa_pairs.append((q, ans))
 
                 st.session_state["last_call_time"] = time.time()
                 st.session_state["call_counter"] += 1
 
-                # write answers to PDF
-                buffer = io.BytesIO()
-                c = canvas.Canvas(buffer, pagesize=letter)
-                width, height = letter
-                y = height - 50
-
-                c.setFont("Helvetica-Bold", 12)
-                c.drawString(50, y, "Generated Answers")
-                y -= 30
-                c.setFont("Helvetica", 10)
-
-                for q, a in answers:
-                    c.setFont("Helvetica-Bold", 10)
-                    for line in wrap_text(f"Q: {q}", 90):
-                        c.drawString(50, y, line)
-                        y -= 14
-                        if y < 60:
-                            c.showPage()
-                            y = height - 50
-                    y -= 4
-                    c.setFont("Helvetica", 10)
-                    for line in wrap_text(a, 90):
-                        c.drawString(60, y, line)
-                        y -= 12
-                        if y < 60:
-                            c.showPage()
-                            y = height - 50
-                    y -= 18
-
-                c.save()
-                buffer.seek(0)
+                pdf_bytes = create_answers_pdf_bytes(qa_pairs)
                 st.success("Answers generated!")
-                st.download_button("📥 Download answers.pdf", data=buffer.getvalue(), file_name="answers.pdf", mime="application/pdf")
+                st.download_button("📥 Download answers.pdf", data=pdf_bytes, file_name="answers.pdf", mime="application/pdf")
 
-# ---------------------------
-# Utilities
-# ---------------------------
-def wrap_text(text: str, width: int = 80) -> List[str]:
-    import textwrap
-    return textwrap.wrap(text, width=width)
 
-# Footer: cooldown / status
+# FOOTER: cooldown / info
 allowed, wait = can_invoke()
 if not allowed:
-    st.info(f"Next free model invocation available in about {int(wait)} seconds.")
+    st.info(f"Next allowed invocation in {int(wait)} seconds.")
 else:
     st.caption("You may invoke the model now. Calls are rate-limited to avoid usage spikes.")
 
-st.caption(f"Note: pipeline TTL = {PIPELINE_TTL_SECONDS}s (auto-refresh). UI auto-refresh interval = {UI_AUTO_REFRESH_MS//60000} minutes.")
+st.caption(f"Note: Pipeline TTL = {PIPELINE_TTL_SECONDS}s • Answer cache TTL = {ANSWER_CACHE_TTL}s")
