@@ -188,7 +188,7 @@ st.sidebar.caption("Auto-refresh will rerun the script every 5 minutes but heavy
 
 if enable_autorefresh:
     # this will cause a rerun precisely every UI_AUTO_REFRESH_MS milliseconds
-    st.autorefresh(interval=UI_AUTO_REFRESH_MS, key="auto_refresh")
+    st_autorefresh(interval=UI_AUTO_REFRESH_MS, key="auto_refresh")
 
 # advanced controls
 show_advanced = st.sidebar.expander("Advanced / Controls", expanded=False)
