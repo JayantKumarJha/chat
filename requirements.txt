@@ -1,3 +1,4 @@
+streamlit>=1.20.0
 streamlit
 transformers
 huggingface_hub
@@ -5,4 +6,5 @@ torch
 PyPDF2
 reportlab
 streamlit-autorefresh
+
 
